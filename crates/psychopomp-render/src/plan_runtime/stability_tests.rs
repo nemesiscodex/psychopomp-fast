@@ -514,6 +514,8 @@ fn artifact(prepared: &PreparedPlan, renderer: &mut HeadlessRenderer, at: f64, n
             renderer,
             &directory.join(format!("{name}.png")),
             Time::try_seconds(at).unwrap(),
+            false,
+            crate::exposure::FrameRate::default(),
         )
         .unwrap();
     }

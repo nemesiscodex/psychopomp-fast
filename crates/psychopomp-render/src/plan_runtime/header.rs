@@ -129,6 +129,14 @@ pub(super) fn compile_inputs(plan: &mut ScenePlan, inputs: &[(String, HeaderPlan
 }
 
 impl PreparedHeader {
+    pub(super) fn ink_rows(
+        &self,
+        renderer: &HeadlessRenderer,
+        sample: impl Fn(&str, &str, f32) -> f32,
+    ) -> Option<[f32; 2]> {
+        renderer.header_ink_rows(&self.plan, &self.glyphs, |p, d| sample(&self.id, p, d))
+    }
+
     pub(super) fn from_recipe(
         id: String,
         plan: HeaderPlan,

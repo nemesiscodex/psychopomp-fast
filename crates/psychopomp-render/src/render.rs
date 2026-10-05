@@ -1592,7 +1592,77 @@ impl TextFilter {
     }
 }
 
-fn composite_text(canvas: &mut [u8], [canvas_width, canvas_height]: [u32; 2], draw: TextDraw) {
+#[derive(Clone, Copy)]
+struct TextSampleAxis {
+    index: [i32; 2],
+    weight: [f32; 2],
+}
+
+impl TextSampleAxis {
+    fn new(position: f32) -> Self {
+        let start = position.floor() as i32;
+        let fraction = position - start as f32;
+        Self {
+            index: [start, start + 1],
+            weight: [1.0 - fraction, fraction],
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TextSampleColumn {
+    axis: TextSampleAxis,
+    coverage: [f32; 2],
+}
+
+impl TextSampleColumn {
+    fn new(position: f32, clip: [f32; 2]) -> Self {
+        let axis = TextSampleAxis::new(position);
+        let coverage = axis.index.map(|column| {
+            ((column as f32 + 1.0).min(clip[1]) - (column as f32).max(clip[0])).clamp(0.0, 1.0)
+        });
+        Self { axis, coverage }
+    }
+}
+
+fn sample_text_axes(sprite: &TextSprite, x: TextSampleColumn, y: TextSampleAxis) -> [f32; 4] {
+    let mut color = [0.0; 4];
+    for (row, wy) in y.index.into_iter().zip(y.weight) {
+        for ((column, wx), coverage) in x.axis.index.into_iter().zip(x.axis.weight).zip(x.coverage)
+        {
+            let weight = wx * wy;
+            if weight == 0.0
+                || column < 0
+                || row < 0
+                || column >= sprite.width as i32
+                || row >= sprite.height as i32
+            {
+                continue;
+            }
+            let offset = (row as usize * sprite.width as usize + column as usize) * 4;
+            let alpha = f32::from(sprite.pixels[offset + 3]) * weight * coverage;
+            if alpha == 0.0 {
+                continue;
+            }
+            for (channel, value) in color[..3].iter_mut().enumerate() {
+                *value += f32::from(sprite.pixels[offset + channel]) * alpha;
+            }
+            color[3] += alpha;
+        }
+    }
+    color
+}
+
+fn composite_text(canvas: &mut [u8], size: [u32; 2], draw: TextDraw) {
+    composite_text_rows(canvas, size, draw, true);
+}
+
+fn composite_text_rows(
+    canvas: &mut [u8],
+    [canvas_width, canvas_height]: [u32; 2],
+    draw: TextDraw,
+    parallel: bool,
+) {
     let TextDraw {
         sprite,
         origin: [x, y],
@@ -1604,7 +1674,26 @@ fn composite_text(canvas: &mut [u8], [canvas_width, canvas_height]: [u32; 2], dr
         mask,
     } = draw;
     let clip_y = clip_y.unwrap_or([0.0, canvas_height as f32]);
-    if opacity <= 0.0 || clip_width <= 0.0 {
+    if opacity <= 0.0 || clip_width <= 0.0 || sprite.width == 0 || sprite.height == 0 {
+        return;
+    }
+    // Raster backing sprites can contain wide transparent padding. Scan the
+    // current alpha rather than cache bounds: callers may mutate or reflect it.
+    let mut ink_left = sprite.width;
+    let mut ink_right = 0;
+    let mut ink_top = sprite.height;
+    let mut ink_bottom = 0;
+    for (index, pixel) in sprite.pixels.as_chunks::<4>().0.iter().enumerate() {
+        if pixel[3] != 0 {
+            let column = index as u32 % sprite.width;
+            let row = index as u32 / sprite.width;
+            ink_left = ink_left.min(column);
+            ink_right = ink_right.max(column + 1);
+            ink_top = ink_top.min(row);
+            ink_bottom = ink_bottom.max(row + 1);
+        }
+    }
+    if ink_right == 0 {
         return;
     }
     let [reach_x, reach_y] = filter.reach();
@@ -1623,11 +1712,39 @@ fn composite_text(canvas: &mut [u8], [canvas_width, canvas_height]: [u32; 2], dr
     });
     // The source mask is filtered with the glyph. Include its complete support;
     // otherwise changing floor/ceil bounds would discard nonzero filtered texels.
-    let left = x - source_left + source_clip[0].floor() - reach_x - 1.0;
-    let right = x - source_left + source_clip[1].ceil() + reach_x + 1.0;
-    let top = (y - reach_y - 1.0).max(clip_y[0]);
-    let bottom = (y + sprite.height as f32 + reach_y + 1.0).min(clip_y[1]);
-    for target_y in (top.floor() as i32).max(0)..(bottom.ceil() as i32).min(canvas_height as i32) {
+    // Bilinear support plus a conservative pixel protects fractional clip and
+    // filter edges. The reference compositor verifies this against the full box.
+    let left = x - source_left + source_clip[0].floor().max(ink_left as f32) - reach_x - 2.0;
+    let right = x - source_left + source_clip[1].ceil().min(ink_right as f32) + reach_x + 2.0;
+    let top = (y + ink_top as f32 - reach_y - 2.0).max(clip_y[0]);
+    let bottom = (y + ink_bottom as f32 + reach_y + 2.0).min(clip_y[1]);
+    let columns = (left.floor() as i32).max(0)..(right.ceil() as i32).min(canvas_width as i32);
+    let x_offsets = match filter {
+        TextFilter::Blur(blur) if blur > 0.0 => [-blur, 0.0, blur],
+        _ => [0.0; 3],
+    };
+    let prepared_columns = columns
+        .clone()
+        .map(|target_x| {
+            let source_x = source_left + target_x as f32 - x;
+            x_offsets.map(|offset| TextSampleColumn::new(source_x + offset, source_clip))
+        })
+        .collect::<Vec<_>>();
+    let row_offsets = match filter {
+        TextFilter::Blur(blur) if blur > 0.0 => vec![-blur, 0.0, blur],
+        TextFilter::Smear { .. } if !smear.is_empty() => {
+            smear.iter().map(|&(offset, _)| offset).collect()
+        }
+        _ => vec![0.0],
+    };
+    let first_row = (top.floor() as i32).clamp(0, canvas_height as i32) as usize;
+    let last_row = (bottom.ceil() as i32).clamp(first_row as i32, canvas_height as i32) as usize;
+    let row_bytes = canvas_width as usize * 4;
+    if row_bytes == 0 {
+        return;
+    }
+    let paint_row = |row: &mut [u8], target_y: usize| {
+        let target_y = target_y as i32;
         let row_start = (target_y as f32).max(clip_y[0]);
         let row_end = (target_y as f32 + 1.).min(clip_y[1]);
         let coverage_y = mask.map_or_else(
@@ -1635,25 +1752,23 @@ fn composite_text(canvas: &mut [u8], [canvas_width, canvas_height]: [u32; 2], dr
             |mask| mask.coverage(row_start, row_end),
         );
         if coverage_y <= 0. {
-            continue;
+            return;
         }
-        for target_x in (left.floor() as i32).max(0)..(right.ceil() as i32).min(canvas_width as i32)
-        {
-            let source_x = source_left + target_x as f32 - x;
-            let source_y = target_y as f32 - y;
+        let source_y = target_y as f32 - y;
+        let rows = row_offsets
+            .iter()
+            .copied()
+            .map(|offset| TextSampleAxis::new(source_y + offset))
+            .collect::<Vec<_>>();
+        for (target_x, axes) in columns.clone().zip(&prepared_columns) {
             let mut color = [0.0; 4];
             match filter {
                 TextFilter::Blur(blur) if blur > 0.0 => {
                     // Bilinear sample locations vary continuously with blur; no
                     // rounded taps that suddenly turn a sharp glyph into a 3x3 copy.
-                    for (dy, wy) in [(-1.0, 0.25), (0.0, 0.5), (1.0, 0.25)] {
-                        for (dx, wx) in [(-1.0, 0.25), (0.0, 0.5), (1.0, 0.25)] {
-                            let sample = sample_text_sprite(
-                                sprite,
-                                source_x + dx * blur,
-                                source_y + dy * blur,
-                                source_clip,
-                            );
+                    for (row, wy) in rows.iter().zip([0.25, 0.5, 0.25]) {
+                        for (column, wx) in axes.iter().zip([0.25, 0.5, 0.25]) {
+                            let sample = sample_text_axes(sprite, *column, *row);
                             for channel in 0..4 {
                                 color[channel] += sample[channel] * wx * wy;
                             }
@@ -1661,15 +1776,14 @@ fn composite_text(canvas: &mut [u8], [canvas_width, canvas_height]: [u32; 2], dr
                     }
                 }
                 TextFilter::Smear { .. } if !smear.is_empty() => {
-                    for &(offset, weight) in &smear {
-                        let sample =
-                            sample_text_sprite(sprite, source_x, source_y + offset, source_clip);
+                    for (row, &(_, weight)) in rows.iter().zip(&smear) {
+                        let sample = sample_text_axes(sprite, axes[0], *row);
                         for channel in 0..4 {
                             color[channel] += sample[channel] * weight;
                         }
                     }
                 }
-                _ => color = sample_text_sprite(sprite, source_x, source_y, source_clip),
+                _ => color = sample_text_axes(sprite, axes[0], rows[0]),
             }
             if color[3] <= 0.0 {
                 continue;
@@ -1680,8 +1794,38 @@ fn composite_text(canvas: &mut [u8], [canvas_width, canvas_height]: [u32; 2], dr
                 (color[2] / color[3]).round() as u8,
                 (color[3] * coverage_y).round() as u8,
             ];
-            let target_index = (target_y as usize * canvas_width as usize + target_x as usize) * 4;
-            blend_pixel(&mut canvas[target_index..target_index + 4], source, opacity);
+            let target_index = target_x as usize * 4;
+            blend_pixel(&mut row[target_index..target_index + 4], source, opacity);
+        }
+    };
+    let rows = &mut canvas[first_row * row_bytes..last_row * row_bytes];
+    let taps = match filter {
+        TextFilter::Blur(blur) if blur > 0.0 => 9,
+        TextFilter::Smear { .. } => smear.len().max(1),
+        _ => 1,
+    };
+    let work = columns
+        .len()
+        .saturating_mul(last_row - first_row)
+        .saturating_mul(taps);
+    // Independent rows retain each pixel's tap order. Join before the next draw
+    // so overlapping actors keep their authored composition order. Small and
+    // sharp sprites stay serial to avoid worker scheduling overhead.
+    if parallel
+        && taps > 1
+        && work >= 50_000
+        && let Some(pool) = crate::pixel_workers::pool()
+    {
+        use rayon::prelude::*;
+        pool.install(|| {
+            rows.par_chunks_mut(row_bytes)
+                .enumerate()
+                .with_min_len(8)
+                .for_each(|(index, row)| paint_row(row, first_row + index))
+        });
+    } else {
+        for (index, row) in rows.chunks_mut(row_bytes).enumerate() {
+            paint_row(row, first_row + index);
         }
     }
 }
@@ -1871,6 +2015,372 @@ fn attributes(base: Attrs<'static>, style: SyntaxStyle) -> Attrs<'static> {
 
 #[cfg(test)]
 mod tests {
+    use super::{blend_pixel, sample_text_sprite};
+    fn reference_composite_text(
+        canvas: &mut [u8],
+        [canvas_width, canvas_height]: [u32; 2],
+        draw: TextDraw,
+    ) {
+        let TextDraw {
+            sprite,
+            origin: [x, y],
+            source_left,
+            clip_width,
+            filter,
+            opacity,
+            clip_y,
+            mask,
+        } = draw;
+        let clip_y = clip_y.unwrap_or([0.0, canvas_height as f32]);
+        if opacity <= 0.0 || clip_width <= 0.0 {
+            return;
+        }
+        let [reach_x, reach_y] = filter.reach();
+        let smear = match filter {
+            TextFilter::Smear { sigma, amount } if sigma > 0.0 && amount > 0.0 => {
+                TextFilter::smear_taps(sigma, amount)
+            }
+            _ => Vec::new(),
+        };
+        let source_clip = [
+            source_left,
+            (source_left + clip_width).min(sprite.width as f32),
+        ];
+        let clip_y = mask.map_or(clip_y, |mask| {
+            [clip_y[0].max(mask.top), clip_y[1].min(mask.bottom)]
+        });
+        // The source mask is filtered with the glyph. Include its complete support;
+        // otherwise changing floor/ceil bounds would discard nonzero filtered texels.
+        let left = x - source_left + source_clip[0].floor() - reach_x - 1.0;
+        let right = x - source_left + source_clip[1].ceil() + reach_x + 1.0;
+        let top = (y - reach_y - 1.0).max(clip_y[0]);
+        let bottom = (y + sprite.height as f32 + reach_y + 1.0).min(clip_y[1]);
+        for target_y in
+            (top.floor() as i32).max(0)..(bottom.ceil() as i32).min(canvas_height as i32)
+        {
+            let row_start = (target_y as f32).max(clip_y[0]);
+            let row_end = (target_y as f32 + 1.).min(clip_y[1]);
+            let coverage_y = mask.map_or_else(
+                || (row_end - row_start).clamp(0., 1.),
+                |mask| mask.coverage(row_start, row_end),
+            );
+            if coverage_y <= 0. {
+                continue;
+            }
+            for target_x in
+                (left.floor() as i32).max(0)..(right.ceil() as i32).min(canvas_width as i32)
+            {
+                let source_x = source_left + target_x as f32 - x;
+                let source_y = target_y as f32 - y;
+                let mut color = [0.0; 4];
+                match filter {
+                    TextFilter::Blur(blur) if blur > 0.0 => {
+                        // Bilinear sample locations vary continuously with blur; no
+                        // rounded taps that suddenly turn a sharp glyph into a 3x3 copy.
+                        for (dy, wy) in [(-1.0, 0.25), (0.0, 0.5), (1.0, 0.25)] {
+                            for (dx, wx) in [(-1.0, 0.25), (0.0, 0.5), (1.0, 0.25)] {
+                                let sample = sample_text_sprite(
+                                    sprite,
+                                    source_x + dx * blur,
+                                    source_y + dy * blur,
+                                    source_clip,
+                                );
+                                for channel in 0..4 {
+                                    color[channel] += sample[channel] * wx * wy;
+                                }
+                            }
+                        }
+                    }
+                    TextFilter::Smear { .. } if !smear.is_empty() => {
+                        for &(offset, weight) in &smear {
+                            let sample = sample_text_sprite(
+                                sprite,
+                                source_x,
+                                source_y + offset,
+                                source_clip,
+                            );
+                            for channel in 0..4 {
+                                color[channel] += sample[channel] * weight;
+                            }
+                        }
+                    }
+                    _ => color = sample_text_sprite(sprite, source_x, source_y, source_clip),
+                }
+                if color[3] <= 0.0 {
+                    continue;
+                }
+                let source = [
+                    (color[0] / color[3]).round() as u8,
+                    (color[1] / color[3]).round() as u8,
+                    (color[2] / color[3]).round() as u8,
+                    (color[3] * coverage_y).round() as u8,
+                ];
+                let target_index =
+                    (target_y as usize * canvas_width as usize + target_x as usize) * 4;
+                blend_pixel(&mut canvas[target_index..target_index + 4], source, opacity);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "manual CPU text compositor timing comparison"]
+    fn prepared_text_axes_timing() {
+        use super::*;
+        let sprite = TextSprite {
+            width: 420,
+            height: 48,
+            advance: 420.0,
+            pixels: (0..420 * 48 * 4)
+                .map(|i| ((i * 73 + i / 7) % 256) as u8)
+                .collect(),
+        };
+        let mut sprite = sprite;
+        for (index, pixel) in sprite.pixels.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let x = index % 420;
+            let y = index / 420;
+            if !(30..180).contains(&x) || !(12..36).contains(&y) || x % 9 > 3 {
+                pixel[3] = 0;
+            }
+        }
+        for filter in [
+            TextFilter::Blur(0.0),
+            TextFilter::Blur(2.3),
+            TextFilter::Smear {
+                sigma: 2.0,
+                amount: 0.7,
+            },
+        ] {
+            for (label, paint) in [
+                (
+                    "reference",
+                    reference_composite_text as fn(&mut [u8], [u32; 2], TextDraw),
+                ),
+                (
+                    "prepared",
+                    composite_text as fn(&mut [u8], [u32; 2], TextDraw),
+                ),
+            ] {
+                let mut canvas = vec![37; 640 * 96 * 4];
+                let draw = TextDraw {
+                    filter,
+                    ..TextDraw::new(&sprite, [30.3, 20.7])
+                };
+                let started = std::time::Instant::now();
+                for _ in 0..100 {
+                    paint(
+                        std::hint::black_box(&mut canvas),
+                        [640, 96],
+                        std::hint::black_box(draw),
+                    );
+                }
+                println!("{label} {} ms", started.elapsed().as_secs_f64() * 1000.0);
+                std::hint::black_box(canvas);
+            }
+        }
+    }
+
+    #[test]
+    fn parallel_text_rows_match_serial_and_original() {
+        use super::*;
+        let mut sprite = TextSprite {
+            width: 1420,
+            height: 126,
+            advance: 1420.0,
+            pixels: (0..1420 * 126 * 4)
+                .map(|i| ((i * 73 + i / 7) % 256) as u8)
+                .collect(),
+        };
+        for sparse in [false, true] {
+            if sparse {
+                for (i, p) in sprite.pixels.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                    if i % 1420 % 11 > 4 || i / 1420 < 20 {
+                        p[3] = 0;
+                    }
+                }
+            }
+            for filter in [
+                TextFilter::Blur(2.3),
+                TextFilter::Smear {
+                    sigma: 1.3,
+                    amount: 0.7,
+                },
+            ] {
+                let draw = TextDraw {
+                    filter,
+                    source_left: 0.37,
+                    clip_width: 1200.6,
+                    mask: Some(VerticalMask {
+                        top: 3.3,
+                        bottom: 150.7,
+                        fade: 4.3,
+                    }),
+                    ..TextDraw::new(&sprite, [20.3, 10.7])
+                };
+                let mut reference = vec![37; 1500 * 160 * 4];
+                let mut serial = reference.clone();
+                let mut parallel = reference.clone();
+                reference_composite_text(&mut reference, [1500, 160], draw);
+                composite_text_rows(&mut serial, [1500, 160], draw, false);
+                composite_text_rows(&mut parallel, [1500, 160], draw, true);
+                assert_eq!(serial, reference);
+                assert_eq!(parallel, reference);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "manual bounded parallel text row timing"]
+    fn parallel_text_rows_timing() {
+        use super::*;
+        let mut sprite = TextSprite {
+            width: 1420,
+            height: 126,
+            advance: 1420.0,
+            pixels: (0..1420 * 126 * 4)
+                .map(|i| ((i * 73 + i / 7) % 256) as u8)
+                .collect(),
+        };
+        for sparse in [false, true] {
+            if sparse {
+                for (i, p) in sprite.pixels.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                    if i % 1420 % 11 > 4 || i / 1420 < 20 {
+                        p[3] = 0;
+                    }
+                }
+            }
+            for parallel in [false, true, false, true] {
+                let draw = TextDraw {
+                    filter: TextFilter::Blur(2.3),
+                    ..TextDraw::new(&sprite, [20.3, 10.7])
+                };
+                let mut canvas = vec![37; 1500 * 160 * 4];
+                let start = std::time::Instant::now();
+                for _ in 0..40 {
+                    composite_text_rows(
+                        std::hint::black_box(&mut canvas),
+                        [1500, 160],
+                        std::hint::black_box(draw),
+                        parallel,
+                    );
+                }
+                println!(
+                    "sparse={sparse} parallel={parallel} {}ms",
+                    start.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn transparent_text_padding_matches_unbounded_reference() {
+        use super::*;
+        for ink in [None, Some([0, 0]), Some([13, 8]), Some([6, 4])] {
+            let mut sprite = TextSprite {
+                width: 14,
+                height: 9,
+                advance: 14.0,
+                pixels: vec![123; 14 * 9 * 4],
+            };
+            for pixel in sprite.pixels.as_chunks_mut::<4>().0 {
+                pixel[3] = 0;
+            }
+            if let Some([x, y]) = ink {
+                sprite.pixels[(y * 14 + x) * 4 + 3] = 231;
+            }
+            for origin in [[-3.7, -2.3], [0.13, 0.77], [3.4, 4.6]] {
+                for clip in [[0.0, 14.0], [0.3, 7.8], [7.3, 10.1]] {
+                    for filter in [
+                        TextFilter::Blur(0.0),
+                        TextFilter::Blur(0.37),
+                        TextFilter::Blur(3.2),
+                        TextFilter::Smear {
+                            sigma: 2.3,
+                            amount: 0.7,
+                        },
+                    ] {
+                        let draw = TextDraw {
+                            source_left: clip[0],
+                            clip_width: clip[1] - clip[0],
+                            filter,
+                            clip_y: Some([0.3, 17.1]),
+                            mask: Some(VerticalMask {
+                                top: 0.5,
+                                bottom: 17.0,
+                                fade: 2.3,
+                            }),
+                            ..TextDraw::new(&sprite, origin)
+                        };
+                        let mut a = vec![37; 24 * 18 * 4];
+                        let mut b = a.clone();
+                        reference_composite_text(&mut a, [24, 18], draw);
+                        composite_text(&mut b, [24, 18], draw);
+                        assert_eq!(a, b, "ink={ink:?} origin={origin:?} clip={clip:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_text_axes_match_reference_pixels() {
+        use super::*;
+        let sprite = TextSprite {
+            width: 9,
+            height: 7,
+            advance: 9.0,
+            pixels: (0..9 * 7 * 4)
+                .map(|i| ((i * 73 + i / 7) % 256) as u8)
+                .collect(),
+        };
+        for x in [-2.5, 0.0, 0.13, 3.75] {
+            for y in [-1.3, 0.0, 0.77, 5.5] {
+                for clip in [[0.0, 9.0], [0.3, 7.8], [-1.0, 4.5]] {
+                    let a = sample_text_sprite(&sprite, x, y, clip);
+                    let b = sample_text_axes(
+                        &sprite,
+                        TextSampleColumn::new(x, clip),
+                        TextSampleAxis::new(y),
+                    );
+                    assert_eq!(a.map(f32::to_bits), b.map(f32::to_bits));
+                    for filter in [
+                        TextFilter::Blur(0.0),
+                        TextFilter::Blur(0.37),
+                        TextFilter::Blur(3.2),
+                        TextFilter::Smear {
+                            sigma: 1.3,
+                            amount: 0.7,
+                        },
+                    ] {
+                        for mask in [
+                            None,
+                            Some(VerticalMask {
+                                top: 2.3,
+                                bottom: 13.7,
+                                fade: 2.0,
+                            }),
+                        ] {
+                            let draw = TextDraw {
+                                origin: [x, y],
+                                source_left: clip[0],
+                                clip_width: clip[1] - clip[0],
+                                filter,
+                                opacity: 0.63,
+                                clip_y: Some([1.2, 15.4]),
+                                mask,
+                                ..TextDraw::new(&sprite, [x, y])
+                            };
+                            let mut a = vec![37; 20 * 18 * 4];
+                            let mut b = a.clone();
+                            reference_composite_text(&mut a, [20, 18], draw);
+                            composite_text(&mut b, [20, 18], draw);
+                            assert_eq!(a, b, "x={x} y={y} clip={clip:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn editor_canvas_points_follow_the_panel_projection() {
         use super::{EditorPanel, editor_canvas_point};

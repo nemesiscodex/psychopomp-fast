@@ -96,6 +96,26 @@ temperature fields, so arbitrary-time sampling and reverse reconstruction remain
 deterministic. `render/effects/combustion.wgsl` owns the bounded volume; closed-form
 gravity/drag embers and screen-space pressure refraction complete the impact.
 
+## fframes rendering
+
+[fframes](https://github.com/dmtrKovalenko/fframes), inspected at
+`b7fc055f7028f4380ed6102d33040fd1bf491036`, separates persistent GPU rendering
+resources from sampled drawing values. Its
+[recorded pictures and filtered layers](https://github.com/dmtrKovalenko/fframes/blob/b7fc055f7028f4380ed6102d33040fd1bf491036/fframes-skia-renderer/src/render/mod.rs)
+avoid repeating stable drawing work. Cache keys retain fractional placement and
+resolved content; perspective transforms do not use its filtered-layer shortcut.
+Its [bounded pipeline](https://github.com/dmtrKovalenko/fframes/blob/b7fc055f7028f4380ed6102d33040fd1bf491036/fframes-skia-renderer/src/skia_pipeline.rs)
+also separates frame generation, rendering, and encoding.
+
+Psychopomp applies the narrower principle of preparing invariant sampling work
+once and restricting expensive pixel work to its actual support. Text bilinear
+axes are prepared per draw, projected transparent overlays reject empty filter
+footprints, and supported Stage overlays average only conservative ink strips.
+The existing GPU Stage exposure and FFmpeg subprocess remain concrete adapters.
+[Export measurements](perf/render-throughput.md) record the tested workloads and
+pixel comparisons. These are rendering changes, not another timeline or quality
+profile.
+
 ## Manim
 
 [Manim](https://docs.manim.community/en/stable/) is the strongest reference for semantic scene construction.

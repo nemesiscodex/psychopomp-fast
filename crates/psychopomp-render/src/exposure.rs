@@ -1,13 +1,15 @@
 //! Frame exposure: the output format, how many shutter samples a frame takes,
 //! their weights across a 180-degree shutter, and encoding a timeline one
 //! exposed frame at a time. Every root and the legacy scenes share it.
-use std::{ops::Range, path::Path, time::Instant};
+use std::{ops::Range, path::Path, str::FromStr, time::Instant};
 
 use anyhow::{Result, bail};
 use psychopomp::{
     composition::{Duration, MediaPlacement, Time, TimeRange},
     math::{Vec2, shapes::Box2, vec2},
 };
+use rayon::prelude::*;
+use serde::Deserialize;
 
 use crate::{
     encode::{FfmpegEncoder, VideoSpec},
@@ -16,10 +18,58 @@ use crate::{
 
 pub(crate) const WIDTH: u32 = 1920;
 pub(crate) const HEIGHT: u32 = 1080;
-const FPS: u32 = 60;
 const TEMPORAL_SAMPLES: u32 = 8;
 const ENTRANCE_TEMPORAL_SAMPLES: u32 = 16;
 const SHUTTER_ANGLE: f32 = 180.0;
+
+/// Delivery cadence, independent of the authored scene clock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "u32")]
+pub(crate) struct FrameRate(u32);
+
+impl FrameRate {
+    pub(crate) fn new(fps: u32) -> Result<Self> {
+        anyhow::ensure!(
+            (1..=1000).contains(&fps),
+            "FPS must be an integer from 1 to 1000"
+        );
+        Ok(Self(fps))
+    }
+
+    pub(crate) fn get(self) -> u32 {
+        self.0
+    }
+
+    pub(crate) fn frame_span(self) -> f64 {
+        1.0 / f64::from(self.0)
+    }
+}
+
+impl Default for FrameRate {
+    fn default() -> Self {
+        Self(60)
+    }
+}
+
+impl TryFrom<u32> for FrameRate {
+    type Error = anyhow::Error;
+
+    fn try_from(fps: u32) -> Result<Self> {
+        Self::new(fps)
+    }
+}
+
+impl FromStr for FrameRate {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        Self::new(
+            value
+                .parse()
+                .map_err(|_| anyhow::anyhow!("FPS must be an integer from 1 to 1000"))?,
+        )
+    }
+}
 
 /// Samples per frame for Scene Plans: more in the first second, where
 /// entrances move fastest.
@@ -42,6 +92,7 @@ pub(crate) fn encode_exposures<K: PartialEq>(
     duration: Duration,
     media: &[MediaPlacement],
     window: TimeRange,
+    fps: FrameRate,
     mut samples_at: impl FnMut(f64) -> u32,
     mut sample_key: impl FnMut(f64) -> Result<K>,
     mut render_exposure: impl FnMut(&mut HeadlessRenderer, &[(f64, f32)]) -> Result<Vec<u8>>,
@@ -59,7 +110,7 @@ pub(crate) fn encode_exposures<K: PartialEq>(
         );
     }
     let started = Instant::now();
-    let frame_count = window.duration().frame_count(FPS);
+    let frame_count = window.duration().frame_count(fps.get());
     let media = media
         .iter()
         .filter_map(|placement| placement.for_window(window))
@@ -69,22 +120,20 @@ pub(crate) fn encode_exposures<K: PartialEq>(
         VideoSpec {
             width: WIDTH,
             height: HEIGHT,
-            fps: FPS,
+            fps: fps.get(),
         },
         &media,
     )?;
     for frame in 0..frame_count {
-        let frame_start = window.start().as_seconds() + frame as f64 / f64::from(FPS);
-        let frame_end = (window.start().as_seconds() + (frame + 1) as f64 / f64::from(FPS))
-            .min(window.end().as_seconds());
+        let (frame_start, frame_end) = frame_bounds(window, frame, fps);
         let center = (frame_start + frame_end) * 0.5;
         let samples = samples_at(center).max(1);
         let exposure = merge_equal_samples(
-            exposure(center, frame_end - frame_start, samples),
+            exposure_at_fps(center, frame_end - frame_start, samples, fps),
             &mut sample_key,
         )?;
         encoder.write_frame(&render_exposure(renderer, &exposure)?)?;
-        if frame % u64::from(FPS) == 0 || frame + 1 == frame_count {
+        if frame % u64::from(fps.get()) == 0 || frame + 1 == frame_count {
             eprintln!(
                 "Rendered {:>3}/{frame_count} frames ({center:.1}s, {samples} samples, {} unique)",
                 frame + 1,
@@ -101,12 +150,30 @@ pub(crate) fn encode_exposures<K: PartialEq>(
     Ok(())
 }
 
+fn frame_bounds(window: TimeRange, frame: u64, fps: FrameRate) -> (f64, f64) {
+    let start = window.start().as_seconds() + frame as f64 / f64::from(fps.get());
+    let end = (window.start().as_seconds() + (frame + 1) as f64 / f64::from(fps.get()))
+        .min(window.end().as_seconds());
+    (start, end)
+}
+
 /// One frame's shutter: `samples` stratified times across a 180-degree
 /// shutter centered on `center` (clamped to `span`), with weights summing
 /// to 1. The weights ease off over the outer quarter at each end, so a fast
 /// highlight's streak fades out instead of ending on a hard copy.
+#[cfg(test)]
 pub(crate) fn exposure(center: f64, span: f64, samples: u32) -> Vec<(f64, f32)> {
-    let shutter = (f64::from(SHUTTER_ANGLE) / 360.0 / f64::from(FPS)).min(span);
+    exposure_at_fps(center, span, samples, FrameRate::default())
+}
+
+/// The same shutter model at the requested output cadence.
+pub(crate) fn exposure_at_fps(
+    center: f64,
+    span: f64,
+    samples: u32,
+    fps: FrameRate,
+) -> Vec<(f64, f32)> {
+    let shutter = (f64::from(SHUTTER_ANGLE) / 360.0 / f64::from(fps.get())).min(span);
     let (start, end) = (center - span * 0.5, center + span * 0.5);
     let mut weighted = (0..samples)
         .map(|sample| {
@@ -162,14 +229,11 @@ pub(crate) fn accumulate(
     for &(time, weight) in exposure {
         let pixels = render_sample(renderer, time)?;
         check_frame(&pixels)?;
-        for (sum, pixel) in sum.chunks_exact_mut(4).zip(pixels.chunks_exact(4)) {
-            add_linear(tables, sum, pixel, weight);
-        }
+        add_pixels(tables, &mut sum, &pixels, weight);
     }
-    Ok(sum
-        .chunks_exact(4)
-        .flat_map(|sum| encode_linear(tables, sum))
-        .collect())
+    let mut pixels = vec![0; FRAME_BYTES];
+    encode_pixels(tables, &sum, &mut pixels);
+    Ok(pixels)
 }
 
 /// `accumulate` for samples that differ only inside `region`. `first` is the
@@ -194,9 +258,26 @@ pub(crate) fn accumulate_region(
         if index > 0 {
             render_sample(&mut frame, time)?;
         }
-        let pixels = region.rows().flat_map(|row| frame[row].chunks_exact(4));
-        for (sum, pixel) in sum.chunks_exact_mut(4).zip(pixels) {
-            add_linear(tables, sum, pixel, weight);
+        let mut remaining = sum.as_mut_slice();
+        let mut work = Vec::with_capacity(region.rows.len());
+        for row in region.rows() {
+            let pixels = &frame[row];
+            let (sums, rest) = remaining.split_at_mut(pixels.len());
+            remaining = rest;
+            work.push((sums, pixels));
+        }
+        if sum_len_at_least_parallel(region.pixel_count() * 4)
+            && let Some(pool) = crate::pixel_workers::pool()
+        {
+            pool.install(|| {
+                work.into_par_iter().for_each(|(sum, pixels)| {
+                    add_pixel_chunk(tables, sum, pixels, weight);
+                });
+            });
+        } else {
+            for (sum, pixels) in work {
+                add_pixel_chunk(tables, sum, pixels, weight);
+            }
         }
     }
     let constant: [[u8; 4]; 256] = std::array::from_fn(|value| {
@@ -207,16 +288,26 @@ pub(crate) fn accumulate_region(
         encode_linear(tables, &sum)
     });
     let mut exposed = first;
-    for pixel in exposed.chunks_exact_mut(4) {
-        for (channel, value) in pixel.iter_mut().enumerate() {
-            *value = constant[*value as usize][channel];
+    // Normalized shutters usually map every constant byte back to itself.
+    // Check the exact table before bypassing the full-frame rewrite, so unusual
+    // weights still retain the same rounding as full-frame accumulation.
+    if constant
+        .iter()
+        .enumerate()
+        .any(|(value, channels)| *channels != [value as u8; 4])
+    {
+        for pixel in exposed.as_chunks_mut::<4>().0 {
+            for (channel, value) in pixel.iter_mut().enumerate() {
+                *value = constant[*value as usize][channel];
+            }
         }
     }
-    let mut sums = sum.chunks_exact(4);
+    let mut offset = 0;
     for row in region.rows() {
-        for (pixel, sum) in exposed[row].chunks_exact_mut(4).zip(&mut sums) {
-            pixel.copy_from_slice(&encode_linear(tables, sum));
-        }
+        let pixels = &mut exposed[row];
+        let end = offset + pixels.len();
+        encode_pixels(tables, &sum[offset..end], pixels);
+        offset = end;
     }
     Ok(exposed)
 }
@@ -286,6 +377,63 @@ impl Region {
 
 const FRAME_BYTES: usize = WIDTH as usize * HEIGHT as usize * 4;
 
+// Each task processes independent pixels. Shutter samples still accumulate in
+// their authored order, and small spans stay serial to avoid scheduling overhead.
+const PIXEL_CHUNK: usize = 16_384;
+
+fn sum_len_at_least_parallel(values: usize) -> bool {
+    values >= PIXEL_CHUNK * 4
+}
+
+fn add_pixels(tables: &LinearTables, sum: &mut [f32], pixels: &[u8], weight: f32) {
+    if sum_len_at_least_parallel(sum.len())
+        && let Some(pool) = crate::pixel_workers::pool()
+    {
+        pool.install(|| {
+            sum.par_chunks_mut(PIXEL_CHUNK)
+                .zip(pixels.par_chunks(PIXEL_CHUNK))
+                .for_each(|(sum, pixels)| add_pixel_chunk(tables, sum, pixels, weight));
+        });
+    } else {
+        add_pixel_chunk(tables, sum, pixels, weight);
+    }
+}
+
+fn add_pixel_chunk(tables: &LinearTables, sum: &mut [f32], pixels: &[u8], weight: f32) {
+    for (sum, pixel) in sum
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(pixels.as_chunks::<4>().0)
+    {
+        add_linear(tables, sum, pixel, weight);
+    }
+}
+
+fn encode_pixels(tables: &LinearTables, sum: &[f32], pixels: &mut [u8]) {
+    let encode = |sum: &[f32], pixels: &mut [u8]| {
+        for (sum, pixel) in sum
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(pixels.as_chunks_mut::<4>().0)
+        {
+            pixel.copy_from_slice(&encode_linear(tables, sum));
+        }
+    };
+    if sum_len_at_least_parallel(sum.len())
+        && let Some(pool) = crate::pixel_workers::pool()
+    {
+        pool.install(|| {
+            sum.par_chunks(PIXEL_CHUNK)
+                .zip(pixels.par_chunks_mut(PIXEL_CHUNK))
+                .for_each(|(sum, pixels)| encode(sum, pixels));
+        });
+    } else {
+        encode(sum, pixels);
+    }
+}
+
 fn check_frame(pixels: &[u8]) -> Result<()> {
     if pixels.len() != FRAME_BYTES {
         bail!(
@@ -347,12 +495,69 @@ fn linear_tables() -> &'static LinearTables {
 
 #[cfg(test)]
 mod tests {
+    use psychopomp::composition::{Time, TimeRange};
     use psychopomp::math::{shapes::Box2, vec2};
 
     use super::{
-        FRAME_BYTES, Region, accumulate_region, add_linear, encode_linear, exposure, linear_tables,
-        merge_equal_samples,
+        FRAME_BYTES, FrameRate, Region, accumulate_region, add_linear, encode_linear, exposure,
+        exposure_at_fps, frame_bounds, linear_tables, merge_equal_samples,
     };
+
+    #[test]
+    fn output_frame_rate_validates_integer_cli_and_json_values() {
+        assert_eq!(FrameRate::default().get(), 60);
+        assert_eq!("24".parse::<FrameRate>().unwrap().get(), 24);
+        assert_eq!(serde_json::from_str::<FrameRate>("24").unwrap().get(), 24);
+        for text in ["0", "-24", "1001", "24.5", "NaN", "null", "\"24\""] {
+            assert!(text.parse::<FrameRate>().is_err());
+            assert!(serde_json::from_str::<FrameRate>(text).is_err());
+        }
+    }
+
+    #[test]
+    fn output_cadence_preserves_window_clock_and_partial_final_frame() {
+        let window = TimeRange::new(Time::seconds(10.0), Time::seconds(11.025));
+        for rate in [24, 60] {
+            let fps = FrameRate::new(rate).unwrap();
+            let count = window.duration().frame_count(rate);
+            assert_eq!(count, if rate == 24 { 25 } else { 62 });
+            let (first, _) = frame_bounds(window, 0, fps);
+            let (last_start, last_end) = frame_bounds(window, count - 1, fps);
+            assert_eq!(first, 10.0);
+            assert_eq!(last_end, 11.025);
+            assert!(last_start < last_end);
+            for frame in 0..count {
+                let (start, end) = frame_bounds(window, frame, fps);
+                let center = (start + end) * 0.5;
+                let samples = exposure_at_fps(center, end - start, 24, fps);
+                assert!(
+                    samples
+                        .iter()
+                        .all(|&(time, _)| time >= start && time <= end)
+                );
+                if frame > 0 {
+                    assert_eq!(frame_bounds(window, frame - 1, fps).1, start);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lower_cadence_retains_180_degree_shutter_and_normalized_weights() {
+        let at60 = exposure(2.0, 1.0 / 60.0, 24);
+        let fps = FrameRate::new(24).unwrap();
+        let at24 = exposure_at_fps(2.0, fps.frame_span(), 24, fps);
+        assert_eq!(at60.len(), at24.len());
+        for ((time60, weight60), (time24, weight24)) in at60.iter().zip(&at24) {
+            assert_eq!(weight60, weight24);
+            assert!(((time24 - 2.0) - (time60 - 2.0) * 2.5).abs() < 1e-12);
+        }
+        assert!((at24.iter().map(|&(_, weight)| weight).sum::<f32>() - 1.0).abs() < 1e-5);
+        assert_eq!(
+            at60,
+            exposure_at_fps(2.0, 1.0 / 60.0, 24, FrameRate::default())
+        );
+    }
 
     #[test]
     fn partial_frame_samples_stay_inside_the_render_window() {
@@ -403,26 +608,40 @@ mod tests {
             }
             frame
         };
-        let samples = exposure(2.0, 1.0 / 60.0, 7);
-
-        let tables = linear_tables();
-        let mut sum = vec![0.0_f32; FRAME_BYTES];
-        for &(time, weight) in &samples {
-            for (sum, pixel) in sum.chunks_exact_mut(4).zip(sample(time).chunks_exact(4)) {
-                add_linear(tables, sum, pixel, weight);
+        // Both the identity-table shortcut and its non-normalized fallback must
+        // match the full-frame exposure, including pixels outside the region.
+        for samples in [
+            exposure(2.0, 1.0 / 60.0, 7),
+            vec![(2.0, 0.4), (2.01, 0.2)],
+            vec![(2.0, 0.9), (2.01, 0.6)],
+        ] {
+            let tables = linear_tables();
+            let mut sum = vec![0.0_f32; FRAME_BYTES];
+            for &(time, weight) in &samples {
+                for (sum, pixel) in sum
+                    .as_chunks_mut::<4>()
+                    .0
+                    .iter_mut()
+                    .zip(sample(time).as_chunks::<4>().0)
+                {
+                    add_linear(tables, sum, pixel, weight);
+                }
             }
-        }
-        let whole = sum
-            .chunks_exact(4)
-            .flat_map(|sum| encode_linear(tables, sum))
-            .collect::<Vec<_>>();
+            let whole = sum
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .flat_map(|sum| encode_linear(tables, sum))
+                .collect::<Vec<_>>();
 
-        let exposed = accumulate_region(&samples, &region, sample(samples[0].0), |frame, time| {
-            region.copy(&sample(time), frame);
-            Ok(())
-        })
-        .unwrap();
-        assert!(exposed == whole);
+            let exposed =
+                accumulate_region(&samples, &region, sample(samples[0].0), |frame, time| {
+                    region.copy(&sample(time), frame);
+                    Ok(())
+                })
+                .unwrap();
+            assert!(exposed == whole);
+        }
     }
 
     #[test]
@@ -433,5 +652,43 @@ mod tests {
         )
         .unwrap();
         assert_eq!(samples, vec![(0.1, 0.5), (0.2, 0.5)]);
+    }
+
+    #[test]
+    fn parallel_pixel_chunks_keep_every_sample_and_rounding_bit() {
+        let tables = linear_tables();
+        // Includes a partial final worker chunk, with complete RGBA pixels.
+        let length = super::PIXEL_CHUNK * 8 + 36;
+        let mut actual = vec![0.0_f32; length];
+        let mut expected = actual.clone();
+        for (sample, weight) in [0.125, 0.375, 0.5].into_iter().enumerate() {
+            let pixels = (0..length)
+                .map(|index| (index * 7 + sample * 31) as u8)
+                .collect::<Vec<_>>();
+            super::add_pixels(tables, &mut actual, &pixels, weight);
+            for (sum, pixel) in expected
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(pixels.as_chunks::<4>().0)
+            {
+                add_linear(tables, sum, pixel, weight);
+            }
+        }
+        assert!(
+            actual
+                .iter()
+                .zip(&expected)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+        );
+        let expected = expected
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .flat_map(|sum| encode_linear(tables, sum))
+            .collect::<Vec<_>>();
+        let mut pixels = vec![0; length];
+        super::encode_pixels(tables, &actual, &mut pixels);
+        assert_eq!(pixels, expected);
     }
 }

@@ -2,6 +2,7 @@
 
 mod encode;
 mod exposure;
+mod pixel_workers;
 mod plan_runtime;
 mod render;
 mod video;
@@ -17,10 +18,11 @@ fn main() -> Result<()> {
     {
         return plan_runtime::command(rest);
     }
+    let (arguments, fps) = plan_runtime::delivery_fps(&arguments)?;
     let output = match arguments.as_slice() {
         [] => PathBuf::from("output/psychopomp-prototype.mp4"),
         [output] => PathBuf::from(output),
-        _ => bail!("usage: psychopomp [output] | psychopomp plan <command>"),
+        _ => bail!("usage: psychopomp [output] [--fps FPS] | psychopomp plan <command>"),
     };
 
     if let Some(parent) = output.parent() {
@@ -28,5 +30,5 @@ fn main() -> Result<()> {
             .with_context(|| format!("create output directory {}", parent.display()))?;
     }
 
-    pollster::block_on(plan_runtime::render_builtin_hero(&output))
+    pollster::block_on(plan_runtime::render_builtin_hero(&output, fps))
 }

@@ -37,7 +37,13 @@ With FFmpeg and `libx264` on `PATH`:
 
 ```sh
 cargo run --release -- plan render target/interactive-showcase/task-lifecycle.json output/task-lifecycle.mp4 --range 3..6 --theme original
+cargo run --release -- plan render target/interactive-showcase/task-lifecycle.json output/task-lifecycle-24fps.mp4 --range 3..6 --theme original --fps 24
 ```
+
+Exports default to 60 FPS. `--fps 24` produces 24 frames per second with the same
+scene duration and audio timing. Any integer FPS from 1 to 1000 is supported.
+The 180° shutter scales with the output frame period. Use the same `--fps` on
+`plan frame` or `plan snapshot` with `--shutter` to inspect that exposure.
 
 The range samples the original scene clock, so cutting into a transition does
 not restart it. Exports choose their theme explicitly; native preferences do not

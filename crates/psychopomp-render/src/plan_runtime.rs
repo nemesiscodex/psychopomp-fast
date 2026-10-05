@@ -8,7 +8,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use psychopomp::{
     composition::{Asset, Duration, MediaPlacement, MediaRole, Time, TimeRange},
-    math::shapes::Box2,
+    math::{shapes::Box2, vec2},
     plan::{
         DeckPlan, MediaKindPlan, MediaRolePlan, ReadPlanError, ReelPlan, ScalarPlan, ScenePlan,
         TargetComponentPlan,
@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
-    exposure::{HEIGHT, WIDTH},
+    exposure::{FrameRate, HEIGHT, WIDTH},
     render::{HeadlessRenderer, RenderSpec, Theme},
 };
 
@@ -74,18 +74,17 @@ impl TargetGeometry {
     }
 }
 
-pub(crate) async fn render_builtin_hero(output: &Path) -> Result<()> {
+pub(crate) async fn render_builtin_hero(output: &Path, fps: FrameRate) -> Result<()> {
     let plan = ScenePlan::from_json(BUILTIN_HERO_PLAN)?;
     let window = plan_window(&plan, WindowSelection::Full)?;
     let (loaded, mut renderer) =
         still::Loaded::prepare(PlanFile::Plan(plan), Path::new("."), Theme::Original).await?;
-    loaded.render_video(&mut renderer, output, window)
+    loaded.render_video(&mut renderer, output, window, fps)
 }
 
-const FRAME_USAGE: &str =
-    "psychopomp plan frame <plan-or-reel.json> <seconds> [output.png] [--shutter] [--theme NAME]";
-const SNAPSHOT_USAGE: &str = "psychopomp plan snapshot <plan-or-reel.json> <a,b,c | from:to:step> <dir> [--compare] [--shutter] [--theme NAME]";
-const RENDER_USAGE: &str = "psychopomp plan render <plan-or-reel.json> [output] [--cue ID | --range START..END] [--theme NAME]";
+const FRAME_USAGE: &str = "psychopomp plan frame <plan-or-reel.json> <seconds> [output.png] [--shutter] [--theme NAME] [--fps FPS]";
+const SNAPSHOT_USAGE: &str = "psychopomp plan snapshot <plan-or-reel.json> <a,b,c | from:to:step> <dir> [--compare] [--shutter] [--theme NAME] [--fps FPS]";
+const RENDER_USAGE: &str = "psychopomp plan render <plan-or-reel.json> [output] [--cue ID | --range START..END] [--theme NAME] [--fps FPS]";
 const PRESENT_USAGE: &str = "psychopomp plan present <plan.json> [--theme NAME] [--speed 1|0.5|0.25|0.1] [--debug] [--reduced-motion] [--full-quality] [--fps FPS] [--benchmark | --benchmark-gpu]";
 
 fn usage() -> String {
@@ -110,15 +109,18 @@ pub(crate) fn command(arguments: &[String]) -> Result<()> {
     };
     match (command.as_str(), arguments) {
         ("render", arguments) => {
-            let (arguments, theme) = delivery_theme(arguments)?;
-            render_command(&arguments, theme)
+            let (arguments, fps) = delivery_fps(arguments)?;
+            let (arguments, theme) = delivery_theme(&arguments)?;
+            render_command(&arguments, theme, fps)
         }
         ("frame", arguments) => {
-            let (arguments, theme) = delivery_theme(arguments)?;
-            frame_command(&arguments, theme)
+            let (arguments, fps) = delivery_fps(arguments)?;
+            let (arguments, theme) = delivery_theme(&arguments)?;
+            frame_command(&arguments, theme, fps)
         }
         ("snapshot", arguments) => {
-            let (arguments, theme) = delivery_theme(arguments)?;
+            let (arguments, fps) = delivery_fps(arguments)?;
+            let (arguments, theme) = delivery_theme(&arguments)?;
             let (arguments, flags) = flags(&arguments, &["--compare", "--shutter"]);
             let [path, times, dir] = arguments.as_slice() else {
                 bail!("usage: {SNAPSHOT_USAGE}");
@@ -130,6 +132,7 @@ pub(crate) fn command(arguments: &[String]) -> Result<()> {
                 flags[0],
                 flags[1],
                 theme,
+                fps,
             )
         }
         ("present", [path, flags @ ..]) => {
@@ -196,6 +199,26 @@ pub(crate) fn command(arguments: &[String]) -> Result<()> {
     }
 }
 
+/// Extract and validate export FPS before any renderer is initialized.
+pub(crate) fn delivery_fps(arguments: &[String]) -> Result<(Vec<String>, FrameRate)> {
+    let mut args = Vec::new();
+    let mut fps = None;
+    let mut iter = arguments.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "--fps" {
+            anyhow::ensure!(fps.is_none(), "--fps may be specified once");
+            fps = Some(
+                iter.next()
+                    .context("--fps requires an integer")?
+                    .parse::<FrameRate>()?,
+            );
+        } else {
+            args.push(arg.clone());
+        }
+    }
+    Ok((args, fps.unwrap_or_default()))
+}
+
 fn delivery_theme(arguments: &[String]) -> Result<(Vec<String>, Theme)> {
     let mut args = Vec::new();
     let mut theme = None;
@@ -224,7 +247,7 @@ fn flags<const N: usize>(arguments: &[String], names: &[&str; N]) -> (Vec<String
     (rest, present)
 }
 
-fn frame_command(arguments: &[String], theme: Theme) -> Result<()> {
+fn frame_command(arguments: &[String], theme: Theme, fps: FrameRate) -> Result<()> {
     let (arguments, [shutter]) = flags(arguments, &["--shutter"]);
     let [plan, seconds, rest @ ..] = arguments.as_slice() else {
         bail!("usage: {FRAME_USAGE}");
@@ -242,10 +265,13 @@ fn frame_command(arguments: &[String], theme: Theme) -> Result<()> {
         .map_or_else(|| PathBuf::from("output/scene-plan.png"), PathBuf::from);
     create_output_directory(&output)?;
     let (loaded, mut renderer) = pollster::block_on(still::Loaded::load(Path::new(plan), theme))?;
-    delivery::write_png(&output, &loaded.still(&mut renderer, seconds, shutter)?)
+    delivery::write_png(
+        &output,
+        &loaded.still(&mut renderer, seconds, shutter, fps)?,
+    )
 }
 
-fn render_command(arguments: &[String], theme: Theme) -> Result<()> {
+fn render_command(arguments: &[String], theme: Theme, fps: FrameRate) -> Result<()> {
     let Some(path) = arguments.first() else {
         bail!("plan render requires a plan path");
     };
@@ -288,7 +314,7 @@ fn render_command(arguments: &[String], theme: Theme) -> Result<()> {
     let window = file.window(selection)?;
     let base = path.parent().unwrap_or_else(|| Path::new("."));
     let (loaded, mut renderer) = pollster::block_on(still::Loaded::prepare(file, base, theme))?;
-    loaded.render_video(&mut renderer, &output, window)
+    loaded.render_video(&mut renderer, &output, window, fps)
 }
 
 fn create_output_directory(output: &Path) -> Result<()> {
@@ -800,8 +826,8 @@ impl PreparedPlan {
 
     /// One exposed frame from weighted shutter samples. A Stage accumulates
     /// its light on the GPU; overlays drawn over it are averaged only across
-    /// samples where they differ, and only where they differ when that is
-    /// just callouts.
+    /// samples where they differ. Supported overlays restrict averaging to
+    /// conservative ink regions; other recipes retain full-frame accumulation.
     fn render_exposure(
         &self,
         renderer: &mut HeadlessRenderer,
@@ -822,6 +848,19 @@ impl PreparedPlan {
             self.overlay_key(time, stage.id(), size)
         })?;
         if !self.only_callouts_differ(&overlays, stage.id())? {
+            if let Some(region) = self.overlay_ink_region(renderer, &overlays) {
+                let mut first = base.clone();
+                self.render_overlays(&mut first, renderer, overlays[0].0, timeline)?;
+                return crate::exposure::accumulate_region(
+                    &overlays,
+                    &region,
+                    first,
+                    |frame, time| {
+                        frame.copy_from_slice(&base);
+                        self.render_overlays(frame, renderer, time, timeline)
+                    },
+                );
+            }
             return crate::exposure::accumulate(renderer, &overlays, |renderer, time| {
                 let mut pixels = base.clone();
                 self.render_overlays(&mut pixels, renderer, time, timeline)?;
@@ -865,6 +904,68 @@ impl PreparedPlan {
             region.copy(&base, frame);
             self.render_overlays_drawing(frame, renderer, time, timeline, |callout| redraw[callout])
         })
+    }
+
+    /// Average only the union of sampled overlay ink. Unsupported recipes retain
+    /// full-frame accumulation until their painting support has explicit bounds.
+    fn overlay_ink_region(
+        &self,
+        renderer: &mut HeadlessRenderer,
+        samples: &[(f64, f32)],
+    ) -> Option<crate::exposure::Region> {
+        if self.plan.actors.iter().any(|actor| {
+            !matches!(
+                actor.recipe.as_str(),
+                "stage" | "caption" | "prototype-header" | "rolling-number" | "text" | "callout"
+            )
+        }) {
+            return None;
+        }
+        let size = renderer.size();
+        let mut bounds = Vec::new();
+        for &(time, _) in samples {
+            let value = |actor: &str, property: &str, default: f32| {
+                self.property_value(&self.timeline, actor, property, time, default)
+            };
+            let strip = |[top, bottom]: [f32; 2]| Box2 {
+                min: vec2(0.0, top),
+                max: vec2(size[0] as f32, bottom),
+            };
+            bounds.extend(
+                self.captions
+                    .iter()
+                    .filter_map(|caption| caption.ink_rows(value))
+                    .map(strip),
+            );
+            bounds.extend(
+                self.headers
+                    .iter()
+                    .filter_map(|header| header.ink_rows(renderer, value))
+                    .map(strip),
+            );
+            bounds.extend(
+                self.rolling
+                    .iter()
+                    .filter_map(|number| number.ink_rows(value))
+                    .map(strip),
+            );
+            for text in &self.texts {
+                if value(&text.id, "opacity", 1.0).clamp(0.0, 1.0) <= 0.0 {
+                    continue;
+                }
+                // Matches the centered sprite's bilinear source support. A mask
+                // can only narrow these rows, so it need not expand the strip.
+                let y = value(&text.id, "y", text.center[1]);
+                let height = (text.font_size * 1.5).ceil();
+                let sprite_y = y - height * 0.5;
+                bounds.push(strip([sprite_y - 1.0, sprite_y + height + 1.0]));
+            }
+            bounds.extend(self.callouts.iter().filter_map(|callout| {
+                self.callout_pose(callout, time, &self.timeline, size)
+                    .and_then(|pose| callout.bounds(renderer, pose))
+            }));
+        }
+        Some(crate::exposure::Region::covering(bounds))
     }
 
     /// Whether `samples` differ in nothing but their callouts.
@@ -1165,6 +1266,10 @@ enum ServerRequest {
         plan: PathBuf,
         output: PathBuf,
         at_nanos: u64,
+        #[serde(default)]
+        shutter: bool,
+        #[serde(default)]
+        fps: FrameRate,
     },
     Render {
         plan: PathBuf,
@@ -1175,6 +1280,8 @@ enum ServerRequest {
         start_nanos: Option<u64>,
         #[serde(default)]
         end_nanos: Option<u64>,
+        #[serde(default)]
+        fps: FrameRate,
     },
     Shutdown,
 }
@@ -1263,6 +1370,8 @@ fn handle_server_request(request: ServerRequest, renderer: &mut HeadlessRenderer
             plan,
             output,
             at_nanos,
+            shutter,
+            fps,
         } => {
             if let Some(parent) = output.parent() {
                 fs::create_dir_all(parent)?;
@@ -1273,7 +1382,14 @@ fn handle_server_request(request: ServerRequest, renderer: &mut HeadlessRenderer
             }
             let base = plan.parent().unwrap_or_else(|| Path::new("."));
             let prepared = PreparedPlan::prepare(scene_plan, base, renderer)?;
-            delivery::render_frame(&prepared, renderer, &output, Time::from_nanos(at_nanos))?;
+            delivery::render_frame(
+                &prepared,
+                renderer,
+                &output,
+                Time::from_nanos(at_nanos),
+                shutter,
+                fps,
+            )?;
             Ok(json!({ "output": output, "atNanos": at_nanos }))
         }
         ServerRequest::Render {
@@ -1282,6 +1398,7 @@ fn handle_server_request(request: ServerRequest, renderer: &mut HeadlessRenderer
             cue,
             start_nanos,
             end_nanos,
+            fps,
         } => {
             if let Some(parent) = output.parent() {
                 fs::create_dir_all(parent)?;
@@ -1298,11 +1415,12 @@ fn handle_server_request(request: ServerRequest, renderer: &mut HeadlessRenderer
             let window = plan_window(&scene_plan, selection)?;
             let base = plan.parent().unwrap_or_else(|| Path::new("."));
             let prepared = PreparedPlan::prepare(scene_plan, base, renderer)?;
-            delivery::render_video(&prepared, renderer, &output, window)?;
+            delivery::render_video(&prepared, renderer, &output, window, fps)?;
             Ok(json!({
                 "output": output,
                 "startNanos": window.start().as_nanos(),
                 "endNanos": window.end().as_nanos(),
+                "fps": fps.get(),
             }))
         }
         ServerRequest::Shutdown => Ok(json!({ "shutdown": true })),
@@ -1376,6 +1494,201 @@ mod tests {
     use super::{
         BUILTIN_HERO_PLAN, CompiledPlan, TargetGeometry, parse_range, validate_renderer_plan,
     };
+
+    #[test]
+    fn delivery_fps_defaults_and_preserves_other_options() {
+        let strings = |args: &[&str]| args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+        let (args, fps) =
+            super::delivery_fps(&strings(&["scene.json", "--theme", "neutral"])).unwrap();
+        assert_eq!(fps.get(), 60);
+        assert_eq!(args, strings(&["scene.json", "--theme", "neutral"]));
+        let (args, fps) =
+            super::delivery_fps(&strings(&["scene.json", "--fps", "24", "--range", "1..2"]))
+                .unwrap();
+        assert_eq!(fps.get(), 24);
+        assert_eq!(args, strings(&["scene.json", "--range", "1..2"]));
+        for args in [
+            vec!["--fps"],
+            vec!["--fps", "0"],
+            vec!["--fps", "1001"],
+            vec!["--fps", "24.0"],
+            vec!["--fps", "--theme"],
+            vec!["--fps", "24", "--fps", "60"],
+        ] {
+            assert!(super::delivery_fps(&strings(&args)).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn delivery_commands_reject_invalid_fps_before_loading_a_plan() {
+        for command in ["render", "frame", "snapshot"] {
+            let args = [command, "missing.json", "--fps", "0"].map(str::to_owned);
+            let error = super::command(&args).unwrap_err().to_string();
+            assert!(error.contains("FPS"), "{command}: {error}");
+        }
+    }
+
+    #[test]
+    fn server_delivery_fps_is_defaulted_and_validated() {
+        for command in ["render", "frame"] {
+            let mut request = json!({"command": command, "plan": "scene.json",
+                "output": "output", "at_nanos": 0});
+            let fps = |request| match request {
+                super::ServerRequest::Render { fps, .. }
+                | super::ServerRequest::Frame { fps, .. } => fps.get(),
+                _ => panic!("expected delivery request"),
+            };
+            assert_eq!(fps(serde_json::from_value(request.clone()).unwrap()), 60);
+            request["fps"] = json!(24);
+            assert_eq!(fps(serde_json::from_value(request.clone()).unwrap()), 24);
+            for invalid in [json!(0), json!(1001), json!(24.5), json!("24"), json!(-24)] {
+                request["fps"] = invalid;
+                assert!(serde_json::from_value::<super::ServerRequest>(request.clone()).is_err());
+            }
+        }
+        let frame = serde_json::from_value::<super::ServerRequest>(json!({
+            "command": "frame", "plan": "scene.json", "output": "frame.png",
+            "at_nanos": 0, "shutter": true, "fps": 24
+        }))
+        .unwrap();
+        assert!(matches!(
+            frame,
+            super::ServerRequest::Frame { shutter: true, .. }
+        ));
+    }
+
+    #[test]
+    #[ignore = "requires a headless GPU; sparse overlay averaging must retain every full-frame pixel"]
+    fn sparse_stage_overlays_match_full_frame_exposure() {
+        use psychopomp::{
+            author::PlanBuilder,
+            caption::{CaptionAlign, CaptionPlan, CaptionSpanPlan},
+            component_prototype::{HeaderEvent, HeaderPlan, HeaderReflection, HeaderSplit},
+            rolling::RollingNumberPlan,
+            tone::Tone,
+        };
+        let mut renderer =
+            pollster::block_on(super::new_renderer("sparse-overlays-proof")).unwrap();
+        for y in [250.25, -12.5, 1060.75] {
+            let mut builder = PlanBuilder::new("sparse-overlays", 2_000_000_000);
+            builder
+                .actor(
+                    "stage",
+                    "stage",
+                    json!({"elements": [{
+                        "kind": "ring", "id": "ring", "at": [160.0, 540.0, 0.0],
+                        "radius": 30.0, "thickness": 2.0
+                    }]}),
+                )
+                .unwrap();
+            let mut caption = CaptionPlan::line(
+                [940.25, y],
+                32.0,
+                vec![CaptionSpanPlan::new("typed caption", Tone::Accent)],
+            )
+            .aligned(CaptionAlign::Center)
+            .chip();
+            caption
+                .lines
+                .push(vec![CaptionSpanPlan::new("second line", Tone::Plain)]);
+            let caption = builder.actor("caption", "caption", caption).unwrap();
+            let typed = builder.channel(&caption, "typed", 0.0);
+            builder.spring(&typed, 0, 1.0, 0.4, 0.0);
+            builder.channel(&caption, "caret", 1.0);
+            let roll = builder
+                .actor(
+                    "number",
+                    "rolling-number",
+                    RollingNumberPlan::new([960.5, y + 135.0], 48.0, "99")
+                        .chip()
+                        .prefix(vec![CaptionSpanPlan::new("n=", Tone::Muted)])
+                        .roll(0, "1,000"),
+                )
+                .unwrap();
+            let rise = builder.channel(&roll, "y", 0.0);
+            builder.spring(&rise, 0, -20.5, 0.5, 0.0);
+            builder
+                .actor(
+                    "header",
+                    "prototype-header",
+                    HeaderPlan {
+                        origin: [270.25, y + 215.5],
+                        text: "Words through the edge".into(),
+                        font_size: 40.0,
+                        width: 1100.0,
+                        split: HeaderSplit::Words,
+                        stagger_millis: 30,
+                        duration_seconds: 0.4,
+                        visible: false,
+                        events: vec![HeaderEvent {
+                            at_nanos: 1,
+                            visible: true,
+                        }],
+                        reflection: Some(HeaderReflection {
+                            opacity: 0.3,
+                            depth: 45.0,
+                            gap: 4.5,
+                        }),
+                    },
+                )
+                .unwrap();
+            let text = builder
+                .actor(
+                    "text",
+                    "text",
+                    json!({
+                        "text": "plain masked text", "center": [800.25, y + 390.5],
+                        "fontSize": 28.0,
+                        "verticalMask": {"top": y + 370.0, "bottom": y + 410.0, "fade": 8.0}
+                    }),
+                )
+                .unwrap();
+            let opacity = builder.channel(&text, "opacity", 0.0);
+            builder.spring(&opacity, 0, 1.0, 0.5, 0.0);
+            let prepared = super::PreparedPlan::prepare(
+                builder.finish().unwrap(),
+                std::path::Path::new("."),
+                &mut renderer,
+            )
+            .unwrap();
+            let samples = [(0.075, 0.25), (0.115, 0.35), (0.195, 0.4)];
+            assert!(
+                prepared
+                    .overlay_ink_region(&mut renderer, &samples)
+                    .is_some()
+            );
+            let super::PreparedRoot::Stage(stage) = &prepared.root else {
+                unreachable!()
+            };
+            let base = stage
+                .render_exposure(&mut renderer, &samples, |actor, property, time, default| {
+                    prepared.property_value(&prepared.timeline, actor, property, time, default)
+                })
+                .unwrap();
+            let expected =
+                crate::exposure::accumulate(&mut renderer, &samples, |renderer, time| {
+                    let mut frame = base.clone();
+                    prepared.render_overlays(&mut frame, renderer, time, &prepared.timeline)?;
+                    Ok(frame)
+                })
+                .unwrap();
+            assert!(
+                expected == prepared.render_exposure(&mut renderer, &samples).unwrap(),
+                "sparse exposure differs at y={y}"
+            );
+            let mut unsupported = prepared;
+            unsupported.compiled.plan.actors.push(ActorPlan {
+                id: "unsupported".into(),
+                recipe: "prototype-venn".into(),
+                data: json!({}),
+            });
+            assert!(
+                unsupported
+                    .overlay_ink_region(&mut renderer, &samples)
+                    .is_none()
+            );
+        }
+    }
 
     #[test]
     fn plan_channels_compile_through_the_shared_timeline() {
