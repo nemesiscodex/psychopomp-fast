@@ -104,7 +104,8 @@ Renderer crate, pixels and delivery:
 - `crates/psychopomp-render/src/render/effects/*.wgsl`: binding-free noise, combustion, pressure, and rewind Modules, composed by the Stage shaders; see `EFFECTS.md`
 - `crates/psychopomp-render/src/render/debug.rs`: optional native debug HUD
 - `crates/psychopomp-render/src/video.rs`: FFmpeg-decoded seekable RGBA frame cache for input video
-- `crates/psychopomp-render/src/exposure.rs`: delivery dimensions, shutter samples and weights, linear-light accumulation, and encoding a timeline one exposed frame at a time
+- `crates/psychopomp-render/src/exposure.rs`: delivery dimensions, validated output FPS, shutter samples and weights, linear-light accumulation, and encoding a timeline one exposed frame at a time
+- `crates/psychopomp-render/src/pixel_workers.rs`: shared bounded Rayon pool for synchronous work on independent text rows and exposure pixels
 - `crates/psychopomp-render/src/encode.rs`: concrete FFmpeg subprocess, raw RGBA protocol, and compiled audio placement
 
 Scene Programs (`scenes/`), each emitting a Scene Plan, Deck, or Reel:
@@ -426,6 +427,25 @@ Stable code lines can be split into cached stable and variable sprites. An inlin
 
 Editor text uses fractional glyph sampling. Premultiplied bilinear sampling preserves subpixel translation; source-range coverage clips fractional reveal columns once, without double-attenuating raster borders. Weighted blur taps move continuously rather than rounding their offsets. Intersecting line pixels clip against the viewport instead of dropping a complete line at its boundary. Planned text actors use this path too. This intentionally changes preview and export pixels; final-window smooth/pixelated filtering remains separate.
 
+The text compositor prepares horizontal bilinear indices, weights, and clip
+coverage once per draw, and vertical indices and weights once per row. It skips
+zero-alpha contributions and restricts filtering to the current raster's
+conservative ink support, including blur and smear. Bounds are measured per draw
+because sprites may be mutated or reflected. It keeps the original sample and
+floating-point accumulation order. Projected card
+overlays build a temporary alpha occupancy grid and skip filtering only when the
+complete clamped filter footprint is transparent. Both optimizations retain the
+existing compositor's exact pixels rather than selecting a different quality
+profile.
+
+`pixel_workers.rs` lazily creates one shared Rayon pool with at most four
+workers, bounded by available CPU parallelism. Large blurred or smeared text
+draws split into disjoint destination rows; exposure accumulation and conversion
+back to RGBA bytes split into disjoint pixels or region row spans. Each operation joins before the
+next draw or shutter sample, preserving actor composition order, sample order,
+and each pixel's floating-point arithmetic. Small work, sharp text, a single
+available CPU, or pool creation failure use the serial path.
+
 Planned text actors may declare a stationary canvas-space `verticalMask`. The compositor integrates its linear top/bottom fades over each pixel row and applies that coverage to sampled text alpha before blending. Text moves through the aperture; the mask does not follow its center or darken already-composited pixels. The same optional path serves native preview and shutter-sampled export, while unmasked actors retain their original pixels. The rolling showcase captions demonstrate this narrow recipe property without a public clipping tree or new Scene Plan version.
 
 The compositor supports multiple non-overlapping reveals on one stable line. Focus ranges and token highlights carry independent vertical geometry, so cursor-only cues do not accidentally move or resize focus.
@@ -539,6 +559,14 @@ per-sample composite and linear-light average cover just the row spans the
 moving callouts ink (`HeadlessRenderer::callout_bounds`, `exposure::accumulate_region`);
 still callouts outside them draw once, and every other pixel takes the same
 weighted average through a per-value table, so the exposure is bit-identical.
+For Stage plans containing only captions, headers, Rolling Numbers, plain text,
+and callouts, varying overlays also use region accumulation. Conservative
+full-width ink strips include every sample's masks, reflection clips, chips,
+carets, and glyph support; each later sample repaints over the developed Stage
+frame. Region averaging processes contiguous rows and omits the constant-pixel
+rewrite only when its exact lookup table is the identity for every byte/channel.
+Other overlay recipes retain full-frame accumulation. Measurements and
+the repeatable export comparison command are in [perf/render-throughput.md](perf/render-throughput.md).
 Sequence Diagram anchors are not implemented.
 
 ### Stage
@@ -588,7 +616,7 @@ once at twice its size into an R8 atlas and drawn with a soft background-colored
 backing for legibility over light. A stage root marks every temporal sample as
 distinct (`ambient_time`), because spin, flow, and grain always move.
 
-Every root renders a frame from one exposure, `exposure::exposure`: stratified
+Every root renders a frame from one exposure, `exposure::exposure_at_fps`: stratified
 times across a 180-degree shutter whose weights ease off over the outer quarter
 at each end, so streaks fade rather than ending on a hard copy. Samples with
 equal visual keys merge their weights. Roots without their own exposure average
@@ -673,6 +701,14 @@ lines' `mark.*` channels turning red just before they leave.
 ## Encoding Is One Concrete Adapter
 
 `plan_runtime/delivery.rs` owns PNG and MP4 delivery separately from `PreparedPlan` preparation and sampling. Video exports keep the authored timeline, full visual quality, shutter samples, and original audio placements.
+
+Output `FrameRate` is a delivery setting, validated as an integer from 1 to 1000
+with a default of 60. CLI `--fps` and persistent render requests carry it through
+plan and Reel delivery to frame counts, sampling times, and FFmpeg's input rate.
+Changing FPS leaves the authored scene and audio clocks intact. The 180-degree
+shutter scales with the output frame period; a partial final frame limits samples
+to its remaining window. Shutter PNGs accept the same FPS for inspection. Native
+presentation pacing remains a separate setting.
 
 A Reel (`plan::ReelPlan`) is delivery, not a scene. The lightweight crate owns its
 validation and timing: `spans` places segments on one clock and `layers_at` returns

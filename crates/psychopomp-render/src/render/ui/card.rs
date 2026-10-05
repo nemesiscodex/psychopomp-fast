@@ -768,6 +768,53 @@ impl CardTransform {
     }
 }
 
+// Overlay ink is often only a thin border. Record occupied tiles once so the
+// compositor can reject fully transparent filter footprints before sampling.
+struct AlphaTiles {
+    occupied: Vec<bool>,
+    columns: usize,
+    size: [u32; 2],
+}
+
+impl AlphaTiles {
+    const SIDE: usize = 16;
+
+    fn new(pixels: &[u8], size: [u32; 2]) -> Self {
+        let columns = (size[0] as usize).div_ceil(Self::SIDE);
+        let rows = (size[1] as usize).div_ceil(Self::SIDE);
+        let mut occupied = vec![false; columns * rows];
+        for (index, pixel) in pixels.as_chunks::<4>().0.iter().enumerate() {
+            if pixel[3] != 0 {
+                let x = index % size[0] as usize;
+                let y = index / size[0] as usize;
+                occupied[y / Self::SIDE * columns + x / Self::SIDE] = true;
+            }
+        }
+        Self {
+            occupied,
+            columns,
+            size,
+        }
+    }
+
+    fn transparent(&self, x: f32, y: f32, blur: f32) -> bool {
+        if !x.is_finite() || !y.is_finite() || !blur.is_finite() {
+            return false;
+        }
+        let radius = if blur <= 0.2 { 0.0 } else { blur * 0.72 };
+        let extent = |center: f32, size: u32| {
+            let lower = (center - radius).clamp(0.0, size as f32 - 1.0).floor() as usize;
+            let upper = ((center + radius).clamp(0.0, size as f32 - 1.0).floor() as usize + 1)
+                .min(size as usize - 1);
+            (lower / Self::SIDE, upper / Self::SIDE)
+        };
+        let (left, right) = extent(x, self.size[0]);
+        let (top, bottom) = extent(y, self.size[1]);
+        (top..=bottom)
+            .all(|row| (left..=right).all(|column| !self.occupied[row * self.columns + column]))
+    }
+}
+
 fn composite_card_layer(
     destination: &mut [u8],
     destination_size: [u32; 2],
@@ -775,6 +822,27 @@ fn composite_card_layer(
     source_size: [u32; 2],
     frame: CardFrame,
     shell: bool,
+) {
+    let alpha_tiles = (!shell).then(|| AlphaTiles::new(source, source_size));
+    composite_card_layer_filtered(
+        destination,
+        destination_size,
+        source,
+        source_size,
+        frame,
+        shell,
+        alpha_tiles.as_ref(),
+    );
+}
+
+fn composite_card_layer_filtered(
+    destination: &mut [u8],
+    destination_size: [u32; 2],
+    source: &[u8],
+    source_size: [u32; 2],
+    frame: CardFrame,
+    shell: bool,
+    alpha_tiles: Option<&AlphaTiles>,
 ) {
     let center = frame.bounds.center();
     let half_size = [frame.bounds.size[0] * 0.5, frame.bounds.size[1] * 0.5];
@@ -845,6 +913,9 @@ fn composite_card_layer(
             };
             let blur = frame.projection.surface_blur.max(0.0)
                 + frame.projection.near_edge_blur.max(0.0) * proximity;
+            if alpha_tiles.is_some_and(|tiles| tiles.transparent(source_x, source_y, blur)) {
+                continue;
+            }
             let color = sample_layer_blurred(source, source_size, source_x, source_y, blur);
             let coverage = if shell {
                 (-distance).clamp(0.0, 1.0)
@@ -1331,6 +1402,90 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn transparent_overlay_tiles_reject_only_zero_filtered_alpha() {
+        let size = [81, 67];
+        let mut pixels = vec![0; size[0] as usize * size[1] as usize * 4];
+        for y in 0..size[1] {
+            for x in 0..size[0] {
+                let index = (y * size[0] + x) as usize * 4;
+                pixels[index..index + 3].fill(203);
+                if !(3..=76).contains(&x) || !(2..=63).contains(&y) || (x == 35 && y == 27) {
+                    pixels[index + 3] = 1 + ((x * 7 + y * 11) % 255) as u8;
+                }
+            }
+        }
+        let tiles = super::AlphaTiles::new(&pixels, size);
+        let source = RgbaSource::packed(&pixels, size).unwrap();
+        let mut rejected = 0;
+        for blur in [0.0, 0.2, 0.20001, 1.0, 4.0, 16.0, 90.0] {
+            for y in -3..72 {
+                for x in -3..86 {
+                    let x = x as f32 + 0.371;
+                    let y = y as f32 + 0.917;
+                    if tiles.transparent(x, y, blur) {
+                        rejected += 1;
+                        assert_eq!(super::sample_source_blurred(source, x, y, blur), [0; 4]);
+                    }
+                }
+            }
+        }
+        assert!(rejected > 1000);
+        assert!(!tiles.transparent(f32::NAN, 10.0, 0.0));
+    }
+
+    #[test]
+    fn transparent_overlay_compositing_matches_unpruned_filter() {
+        let source_size = [81, 67];
+        let mut source = vec![0; 81 * 67 * 4];
+        for y in 0..67 {
+            for x in 0..81 {
+                let index = (y * 81 + x) * 4;
+                source[index..index + 3].fill(197);
+                if !(2..=78).contains(&x) || !(2..=64).contains(&y) {
+                    source[index + 3] = (x * 7 + y * 11) as u8;
+                }
+            }
+        }
+        for tilt in [0.0, 0.27, -0.37] {
+            for blur in [0.0, 0.2, 0.2001, 4.0, 16.0] {
+                let frame = CardFrame {
+                    bounds: Bounds::from_center([57.37, 42.91], [81.0, 67.0]),
+                    style: CardStyle::standard(),
+                    projection: CardProjection {
+                        tilt_x: tilt,
+                        tilt_y: -tilt * 0.7,
+                        rotation_z: tilt * 0.5,
+                        scale: 0.93,
+                        surface_blur: blur,
+                        near_edge_blur: 8.0,
+                    },
+                    opacity: 0.73,
+                };
+                let mut expected = vec![123; 113 * 89 * 4];
+                let mut actual = expected.clone();
+                super::composite_card_layer_filtered(
+                    &mut expected,
+                    [113, 89],
+                    &source,
+                    source_size,
+                    frame,
+                    false,
+                    None,
+                );
+                super::composite_card_layer(
+                    &mut actual,
+                    [113, 89],
+                    &source,
+                    source_size,
+                    frame,
+                    false,
+                );
+                assert_eq!(actual, expected, "tilt {tilt} blur {blur}");
             }
         }
     }

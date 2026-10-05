@@ -33,6 +33,31 @@ pub(crate) struct HeaderGlyphs {
 }
 
 impl HeadlessRenderer {
+    /// The normal mask and reflection clip bound every sampled header word.
+    pub(crate) fn header_ink_rows(
+        &self,
+        plan: &HeaderPlan,
+        glyphs: &HeaderGlyphs,
+        sample: impl Fn(&str, f32) -> f32,
+    ) -> Option<[f32; 2]> {
+        let opacity = sample("opacity", 1.0).clamp(0.0, 1.0);
+        if opacity <= 0.0
+            || !glyphs.ranges.iter().enumerate().any(|(index, _)| {
+                sample(&format!("__header.{index}.reveal"), f32::from(plan.visible)).clamp(0.0, 1.0)
+                    * opacity
+                    > 0.0
+            })
+        {
+            return None;
+        }
+        let y = sample("y", plan.origin[1]);
+        let edge = y + glyphs.ink_bottom + 6.0;
+        let bottom = plan.reflection.map_or(edge, |reflection| {
+            edge.max(edge + reflection.gap + reflection.depth)
+        });
+        Some([y - 16.0, bottom])
+    }
+
     pub(crate) fn prepare_header(&mut self, plan: &HeaderPlan) -> Result<HeaderGlyphs> {
         let height = (plan.font_size * 1.4).ceil() as u32;
         let width = plan.width.ceil() as u32;

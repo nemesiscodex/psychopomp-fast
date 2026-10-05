@@ -109,7 +109,15 @@ cargo run --release -- plan render target/agent-demo.json output/window.mp4 --ra
 
 A Render Window trims and rebases intersecting media to output time zero, but visual sampling remains on the original global scene clock. Starting a window in the middle of a spring therefore preserves its position and velocity.
 
-Delivery remains frame-based: a window whose duration is not exactly frame-aligned emits one final frame sampled only within the remaining window interval. At 60 fps, the encoded duration therefore rounds up to the next frame boundary.
+Exports default to 60 FPS. Add `--fps 24` to `plan render` for 24 FPS, or choose
+any integer from 1 to 1000. This changes output cadence without retiming the
+Scene Plan, Reel, or audio. Shutter duration remains 180° of the selected frame
+period, with the same temporal sample counts. `plan frame` and `plan snapshot`
+accept the same `--fps` to match an export when using `--shutter`.
+
+Delivery remains frame-based: a window whose duration is not exactly
+frame-aligned emits one final frame sampled only within the remaining window
+interval. Encoded duration rounds up to the next boundary at the selected FPS.
 
 ## Play As A Presentation
 
@@ -741,6 +749,10 @@ Render an exact range:
 ```json
 {"id":3,"command":"render","plan":"target/agent-demo.json","output":"output/window.mp4","start_nanos":200000000,"end_nanos":400000000}
 ```
+
+Render requests accept `"fps":24`, defaulting to 60 when omitted. Frame requests
+accept `"shutter":true` and the same `"fps":24` to inspect export motion blur.
+FPS must be an integer from 1 to 1000, and instantaneous frames ignore cadence.
 
 Render a cue:
 

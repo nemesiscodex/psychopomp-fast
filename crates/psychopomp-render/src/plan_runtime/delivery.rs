@@ -6,7 +6,7 @@ use psychopomp::composition::{Time, TimeRange};
 
 use super::{PreparedPlan, reel::PreparedReel};
 use crate::{
-    exposure::{HEIGHT, WIDTH, encode_exposures},
+    exposure::{FrameRate, HEIGHT, WIDTH, encode_exposures, exposure_at_fps, merge_equal_samples},
     render::HeadlessRenderer,
 };
 
@@ -15,6 +15,7 @@ pub(super) fn render_video(
     renderer: &mut HeadlessRenderer,
     output: &Path,
     window: TimeRange,
+    fps: FrameRate,
 ) -> Result<()> {
     renderer.set_file_name(prepared.file_name());
     encode_exposures(
@@ -23,6 +24,7 @@ pub(super) fn render_video(
         prepared.duration(),
         &prepared.media,
         window,
+        fps,
         |center| prepared.temporal_samples(center),
         |time| prepared.visual_sample_key(time),
         |renderer, exposure| prepared.render_exposure(renderer, exposure),
@@ -34,6 +36,7 @@ pub(super) fn render_reel(
     renderer: &mut HeadlessRenderer,
     output: &Path,
     window: TimeRange,
+    fps: FrameRate,
 ) -> Result<()> {
     encode_exposures(
         renderer,
@@ -41,6 +44,7 @@ pub(super) fn render_reel(
         prepared.duration(),
         prepared.media(),
         window,
+        fps,
         |center| prepared.temporal_samples(center),
         |time| prepared.visual_sample_key(time),
         |renderer, exposure| prepared.render_exposure(renderer, exposure),
@@ -52,9 +56,18 @@ pub(super) fn render_frame(
     renderer: &mut HeadlessRenderer,
     output: &Path,
     at: Time,
+    shutter: bool,
+    fps: FrameRate,
 ) -> Result<()> {
     renderer.set_file_name(prepared.file_name());
-    let pixels = prepared.render_sample(renderer, at.as_seconds())?;
+    let pixels = if shutter {
+        let time = at.as_seconds();
+        let samples = exposure_at_fps(time, fps.frame_span(), prepared.temporal_samples(time), fps);
+        let samples = merge_equal_samples(samples, |time| prepared.visual_sample_key(time))?;
+        prepared.render_exposure(renderer, &samples)?
+    } else {
+        prepared.render_sample(renderer, at.as_seconds())?
+    };
     write_png(output, &pixels)
 }
 

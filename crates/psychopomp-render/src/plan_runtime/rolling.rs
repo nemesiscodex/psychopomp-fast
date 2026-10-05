@@ -55,6 +55,26 @@ pub(super) struct PreparedRollingNumber {
 }
 
 impl PreparedRollingNumber {
+    /// Wheels are masked to one stationary row; symbols use the sprite support.
+    pub(super) fn ink_rows(&self, sample: impl Fn(&str, &str, f32) -> f32) -> Option<[f32; 2]> {
+        if sample(&self.id, "opacity", 1.0).clamp(0.0, 1.0) <= 0.001 {
+            return None;
+        }
+        let y = self.plan.origin[1] + sample(&self.id, "y", 0.0);
+        let height = (self.plan.size * 1.5).ceil();
+        let sprite_y = y - height * 0.5;
+        let mut top = (sprite_y - 1.0).min(y - self.plan.row_height() * 0.5);
+        let mut bottom = (sprite_y + height + 1.0).max(y + self.plan.row_height() * 0.5);
+        if self.plan.chip {
+            let caption =
+                psychopomp::caption::CaptionPlan::line([0.0, 0.0], self.plan.size, Vec::new());
+            let half = caption.line_height() * 0.5 + 4.0;
+            top = top.min(y - half);
+            bottom = bottom.max((y - half) + half * 2.0);
+        }
+        Some([top, bottom])
+    }
+
     /// Samples differ while a change settles, even with no channel moving.
     pub(super) fn moving(&self, time: f64) -> bool {
         self.roll.moving(time)

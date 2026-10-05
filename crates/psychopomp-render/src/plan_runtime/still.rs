@@ -12,7 +12,7 @@ use super::{
     DECK_UNSUPPORTED, PlanFile, PreparedPlan, Theme, delivery, new_renderer, preflight, reel,
 };
 use crate::{
-    exposure::{HEIGHT, WIDTH, exposure, merge_equal_samples},
+    exposure::{FrameRate, HEIGHT, WIDTH, exposure_at_fps, merge_equal_samples},
     render::HeadlessRenderer,
 };
 
@@ -58,10 +58,11 @@ impl Loaded {
         renderer: &mut HeadlessRenderer,
         output: &Path,
         window: TimeRange,
+        fps: FrameRate,
     ) -> Result<()> {
         match self {
-            Self::Plan(plan) => delivery::render_video(plan, renderer, output, window),
-            Self::Reel(reel) => delivery::render_reel(reel, renderer, output, window),
+            Self::Plan(plan) => delivery::render_video(plan, renderer, output, window, fps),
+            Self::Reel(reel) => delivery::render_reel(reel, renderer, output, window, fps),
         }
     }
 
@@ -79,21 +80,22 @@ impl Loaded {
         renderer: &mut HeadlessRenderer,
         at: f64,
         shutter: bool,
+        fps: FrameRate,
     ) -> Result<Vec<u8>> {
         ensure!(
             (0.0..=self.duration_seconds()).contains(&at),
             "frame time {at}s is outside 0..{:.3}s",
             self.duration_seconds()
         );
-        let span = 1.0 / 60.0;
+        let span = fps.frame_span();
         match self {
             Self::Plan(plan) if shutter => {
-                let samples = exposure(at, span, plan.temporal_samples(at));
+                let samples = exposure_at_fps(at, span, plan.temporal_samples(at), fps);
                 let samples = merge_equal_samples(samples, |time| plan.visual_sample_key(time))?;
                 plan.render_exposure(renderer, &samples)
             }
             Self::Reel(reel) if shutter => {
-                let samples = exposure(at, span, reel.temporal_samples(at));
+                let samples = exposure_at_fps(at, span, reel.temporal_samples(at), fps);
                 let samples = merge_equal_samples(samples, |time| reel.visual_sample_key(time))?;
                 reel.render_exposure(renderer, &samples)
             }
@@ -138,6 +140,7 @@ pub(super) fn snapshot(
     compare: bool,
     shutter: bool,
     theme: Theme,
+    fps: FrameRate,
 ) -> Result<()> {
     let (loaded, mut renderer) = pollster::block_on(Loaded::load(path, theme))?;
     if !compare {
@@ -146,7 +149,7 @@ pub(super) fn snapshot(
     let mut reports = Vec::new();
     let mut differing = 0;
     for &at in times {
-        let pixels = loaded.still(&mut renderer, at, shutter)?;
+        let pixels = loaded.still(&mut renderer, at, shutter, fps)?;
         let file = dir.join(frame_name(at));
         if !compare {
             delivery::write_png(&file, &pixels)?;
